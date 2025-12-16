@@ -1205,7 +1205,7 @@ async def support(ctx):
     )
     embed.add_field(
         name="💻 GitHub",
-        value="[View Source Code](https://github.com/BensMusic)",
+        value="[View Source Code](https://github.com/BensG0ming/BensMusic)",
         inline=False
     )
     embed.set_footer(text="BensMusic v2.0")
