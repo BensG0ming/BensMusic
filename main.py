@@ -1,35 +1,17 @@
-import discord
-from discord.ext import commands
-import asyncio
-import yt_dlp
-import re
-from collections import deque
-import time
+import discord, asyncio,yt_dlp,time, concurrent.futures
+from discord.ext import commands;from collections import deque;from functools import partial
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
-
 bot = commands.Bot(command_prefix='b!', intents=intents, help_command=None)
-
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 queues = {}
 loop_mode = {}
 volume_levels = {}
 current_songs = {}
 voice_clients = {}
-
-ydl_opts = {
-    'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-    'noplaylist': False,
-    'quiet': True,
-    'no_warnings': True,
-    'extract_flat': 'in_playlist',
-    'ignoreerrors': True,
-    'postprocessors': [{
-        'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'best',
-    }],
-}
+alone_timers = {}
 
 ffmpeg_options = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
@@ -63,23 +45,88 @@ def get_current_song(guild_id):
 def set_current_song(guild_id, song):
     current_songs[guild_id] = song
 
+async def check_alone_in_channel(guild_id):
+    if guild_id in alone_timers:
+        alone_timers[guild_id].cancel()
+    
+    voice_client = voice_clients.get(guild_id)
+    if not voice_client or not voice_client.is_connected():
+        return
+    
+    channel = voice_client.channel
+    members = [m for m in channel.members if not m.bot]
+    
+    if len(members) == 0:
+        timer = asyncio.create_task(alone_timer(guild_id, channel))
+        alone_timers[guild_id] = timer
+
+async def alone_timer(guild_id, channel):
+    try:
+        await asyncio.sleep(300)
+        
+        voice_client = voice_clients.get(guild_id)
+        if voice_client and voice_client.is_connected():
+            members = [m for m in voice_client.channel.members if not m.bot]
+            if len(members) == 0:
+                try:
+                    await voice_client.channel.edit(status=None)
+                except:
+                    pass
+                
+                if voice_client.is_playing():
+                    voice_client.stop()
+                await voice_client.disconnect()
+                del voice_clients[guild_id]
+                
+                if guild_id in queues:
+                    queues[guild_id].clear()
+                if guild_id in current_songs:
+                    del current_songs[guild_id]
+                if guild_id in alone_timers:
+                    del alone_timers[guild_id]
+                
+                embed = discord.Embed(
+                    description="⏹️ Đã rời khỏi kênh do không có ai trong 5 phút",
+                    color=0x2F3136
+                )
+                
+                text_channel = None
+                for ch in channel.guild.text_channels:
+                    if ch.permissions_for(channel.guild.me).send_messages:
+                        text_channel = ch
+                        break
+                
+                if text_channel:
+                    await text_channel.send(embed=embed)
+    except asyncio.CancelledError:
+        pass
+
 async def search_youtube(query):
-    ydl_search = {
-        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-        'noplaylist': True,
-        'quiet': True,
-        'no_warnings': True,
-        'default_search': 'ytsearch',
-        'extract_flat': False,
-    }
-    with yt_dlp.YoutubeDL(ydl_search) as ydl:
-        try:
-            if 'http' in query:
-                info = ydl.extract_info(query, download=False)
+    def _sync_extract(query_str):
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'nocheckcertificate': True,
+            'source_address': '0.0.0.0',
+            'socket_timeout': 10,
+            'retries': 3,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            if 'http' in query_str:
+                info = ydl.extract_info(query_str, download=False)
             else:
-                info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-                if 'entries' in info:
+                info = ydl.extract_info(f"ytsearch1:{query_str}", download=False)
+                if 'entries' in info and len(info['entries']) > 0:
                     info = info['entries'][0]
+                else:
+                    return None
+            
+            if not info:
+                return None
+                
             return {
                 'url': info['url'],
                 'title': info.get('title', 'Unknown'),
@@ -88,35 +135,62 @@ async def search_youtube(query):
                 'webpage_url': info.get('webpage_url', ''),
                 'uploader': info.get('uploader', 'Unknown')
             }
-        except Exception as e:
-            return None
+    
+    loop = asyncio.get_event_loop()
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(executor, _sync_extract, query),
+            timeout=20.0
+        )
+        return result
+    except asyncio.TimeoutError:
+        print(f"Timeout khi tìm kiếm: {query}")
+        return None
+    except Exception as e:
+        print(f"Lỗi tìm kiếm: {e}")
+        return None
 
 async def get_playlist_videos(url):
-    ydl_playlist = {
-        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': True,
-        'ignoreerrors': True,
-    }
-    with yt_dlp.YoutubeDL(ydl_playlist) as ydl:
-        try:
-            info = ydl.extract_info(url, download=False)
-            if 'entries' in info:
-                videos = []
-                for entry in info['entries']:
-                    if entry:
-                        videos.append({
-                            'title': entry.get('title', 'Unknown'),
-                            'url': entry.get('url', ''),
-                            'id': entry.get('id', ''),
-                            'duration': entry.get('duration', 0),
-                            'webpage_url': f"https://youtube.com/watch?v={entry.get('id', '')}"
-                        })
-                return videos
-            return []
-        except:
-            return []
+    def _sync_get_playlist(url_str):
+        ydl_opts = {
+            'format': 'bestaudio*',
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True,
+            'ignoreerrors': True,
+            'nocheckcertificate': True,
+            'source_address': '0.0.0.0',
+            'socket_timeout': 10,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                info = ydl.extract_info(url_str, download=False)
+                if 'entries' in info:
+                    videos = []
+                    for entry in info['entries']:
+                        if entry:
+                            videos.append({
+                                'title': entry.get('title', 'Unknown'),
+                                'url': entry.get('url', ''),
+                                'id': entry.get('id', ''),
+                                'duration': entry.get('duration', 0),
+                                'webpage_url': f"https://youtube.com/watch?v={entry.get('id', '')}"
+                            })
+                    return videos
+                return []
+            except:
+                return []
+    
+    loop = asyncio.get_event_loop()
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(executor, _sync_get_playlist, url),
+            timeout=30.0
+        )
+        return result
+    except:
+        return []
 
 def format_duration(seconds):
     if not seconds:
@@ -209,7 +283,7 @@ async def play_song(ctx, song_info):
         if song_info['thumbnail']:
             embed.set_thumbnail(url=song_info['thumbnail'])
         
-        embed.set_footer(text=f"Yêu cầu bởi {ctx.author.display_name}", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        embed.set_footer(text=f"Yêu cầu bởi {ctx.author.display_name} • By BensGaming", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
         embed.timestamp = discord.utils.utcnow()
         
         await ctx.send(embed=embed)
@@ -232,6 +306,26 @@ async def on_ready():
     )
     await bot.change_presence(activity=activity)
 
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member.bot:
+        return
+    
+    if before.channel is not None:
+        guild_id = before.channel.guild.id
+        if guild_id in voice_clients:
+            voice_client = voice_clients[guild_id]
+            if voice_client.channel == before.channel:
+                await check_alone_in_channel(guild_id)
+    
+    if after.channel is not None:
+        guild_id = after.channel.guild.id
+        if guild_id in voice_clients and guild_id in alone_timers:
+            voice_client = voice_clients[guild_id]
+            if voice_client.channel == after.channel:
+                alone_timers[guild_id].cancel()
+                del alone_timers[guild_id]
+
 @bot.command(name='play', aliases=['p'])
 async def play(ctx, *, query: str):
     if not ctx.author.voice:
@@ -248,6 +342,7 @@ async def play(ctx, *, query: str):
     if guild_id not in voice_clients or not voice_clients[guild_id].is_connected():
         voice_client = await channel.connect()
         voice_clients[guild_id] = voice_client
+        await check_alone_in_channel(guild_id)
     
     embed = discord.Embed(
         description=f"🔍 Đang tìm kiếm **{query}**...",
@@ -256,59 +351,75 @@ async def play(ctx, *, query: str):
     status_msg = await ctx.send(embed=embed)
     
     if 'playlist' in query.lower() or 'list=' in query:
-        videos = await get_playlist_videos(query)
-        if videos:
-            queue = get_queue(guild_id)
-            for video in videos:
-                queue.append(video)
-            
+        try:
+            videos = await get_playlist_videos(query)
+            if videos:
+                queue = get_queue(guild_id)
+                for video in videos:
+                    queue.append(video)
+                
+                await status_msg.delete()
+                embed = discord.Embed(
+                    title="",
+                    description=f"### 📋 Đã thêm playlist\n**{len(videos)}** bài hát đã được thêm vào hàng đợi",
+                    color=0x57F287
+                )
+                embed.set_footer(text=f"Yêu cầu bởi {ctx.author.display_name}", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+                await ctx.send(embed=embed)
+                
+                if not voice_clients[guild_id].is_playing():
+                    await play_next(ctx)
+            else:
+                await status_msg.delete()
+                embed = discord.Embed(
+                    description="❌ Không thể tải playlist hoặc quá thời gian chờ",
+                    color=0xED4245
+                )
+                await ctx.send(embed=embed)
+        except Exception as e:
             await status_msg.delete()
             embed = discord.Embed(
-                title="",
-                description=f"### 📋 Đã thêm playlist\n**{len(videos)}** bài hát đã được thêm vào queue",
-                color=0x57F287
-            )
-            embed.set_footer(text=f"Yêu cầu bởi {ctx.author.display_name}", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
-            await ctx.send(embed=embed)
-            
-            if not voice_clients[guild_id].is_playing():
-                await play_next(ctx)
-        else:
-            await status_msg.delete()
-            embed = discord.Embed(
-                description="❌ Không thể tải playlist",
+                description=f"❌ Lỗi khi tải playlist",
                 color=0xED4245
             )
             await ctx.send(embed=embed)
     else:
-        song_info = await search_youtube(query)
-        await status_msg.delete()
-        
-        if song_info:
-            if voice_clients[guild_id].is_playing():
-                queue = get_queue(guild_id)
-                queue.append(song_info)
-                
-                embed = discord.Embed(
-                    title="",
-                    description=f"### ➕ Đã thêm vào queue\n**[{song_info['title']}]({song_info['webpage_url']})**",
-                    color=0x5865F2
-                )
-                embed.add_field(name="📍 Vị trí", value=f"`#{len(queue)}`", inline=True)
-                embed.add_field(name="⏱️ Thời lượng", value=f"`{format_duration(song_info['duration'])}`", inline=True)
-                embed.add_field(name="📺 Kênh", value=f"`{song_info.get('uploader', 'Unknown')}`", inline=True)
-                
-                if song_info['thumbnail']:
-                    embed.set_thumbnail(url=song_info['thumbnail'])
-                
-                embed.set_footer(text=f"Yêu cầu bởi {ctx.author.display_name}", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
-                
-                await ctx.send(embed=embed)
+        try:
+            song_info = await search_youtube(query)
+            await status_msg.delete()
+            
+            if song_info:
+                if voice_clients[guild_id].is_playing():
+                    queue = get_queue(guild_id)
+                    queue.append(song_info)
+                    
+                    embed = discord.Embed(
+                        title="",
+                        description=f"### ➕ Đã thêm vào hàng đợi\n**[{song_info['title']}]({song_info['webpage_url']})**",
+                        color=0x5865F2
+                    )
+                    embed.add_field(name="📍 Vị trí", value=f"`#{len(queue)}`", inline=True)
+                    embed.add_field(name="⏱️ Thời lượng", value=f"`{format_duration(song_info['duration'])}`", inline=True)
+                    embed.add_field(name="📺 Kênh", value=f"`{song_info.get('uploader', 'Unknown')}`", inline=True)
+                    
+                    if song_info['thumbnail']:
+                        embed.set_thumbnail(url=song_info['thumbnail'])
+                    
+                    embed.set_footer(text=f"Yêu cầu bởi {ctx.author.display_name}", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+                    
+                    await ctx.send(embed=embed)
+                else:
+                    await play_song(ctx, song_info)
             else:
-                await play_song(ctx, song_info)
-        else:
+                embed = discord.Embed(
+                    description="❌ Không tìm thấy bài hát hoặc quá thời gian chờ (20s)",
+                    color=0xED4245
+                )
+                await ctx.send(embed=embed)
+        except Exception as e:
+            await status_msg.delete()
             embed = discord.Embed(
-                description="❌ Không tìm thấy bài hát",
+                description=f"❌ Lỗi không xác định khi tìm kiếm",
                 color=0xED4245
             )
             await ctx.send(embed=embed)
@@ -333,6 +444,9 @@ async def stop(ctx):
             queues[guild_id].clear()
         if guild_id in current_songs:
             del current_songs[guild_id]
+        if guild_id in alone_timers:
+            alone_timers[guild_id].cancel()
+            del alone_timers[guild_id]
         
         embed = discord.Embed(
             description="⏹️ Đã dừng phát nhạc và rời khỏi voice channel",
@@ -669,7 +783,7 @@ async def help_cmd(ctx):
         inline=False
     )
     
-    embed.set_footer(text="Prefix: b! • Sử dụng b!help <lệnh> để xem chi tiết")
+    embed.set_footer(text="Prefix: b! | BensMusic", icon_url=bot.user.avatar.url if bot.user.avatar else None)
     embed.timestamp = discord.utils.utcnow()
     
     await ctx.send(embed=embed)
@@ -697,6 +811,7 @@ async def join(ctx):
     
     voice_client = await channel.connect()
     voice_clients[guild_id] = voice_client
+    await check_alone_in_channel(guild_id)
     
     embed = discord.Embed(
         description=f"✅ Đã tham gia **{channel.name}**",
@@ -732,6 +847,9 @@ async def leave(ctx):
         queues[guild_id].clear()
     if guild_id in current_songs:
         del current_songs[guild_id]
+    if guild_id in alone_timers:
+        alone_timers[guild_id].cancel()
+        del alone_timers[guild_id]
     
     embed = discord.Embed(
         description="👋 Đã rời khỏi voice channel",
@@ -790,202 +908,82 @@ async def move(ctx, from_pos: int, to_pos: int):
     )
     await ctx.send(embed=embed)
 
-@bot.command(name='lyrics', aliases=['ly'])
-async def lyrics(ctx, *, song_name: str = None):
-    guild_id = ctx.guild.id
-    current = get_current_song(guild_id)
-    
-    if not song_name and not current:
-        embed = discord.Embed(
-            description="❌ Vui lòng nhập tên bài hát hoặc phát một bài hát",
-            color=0xED4245
-        )
-        await ctx.send(embed=embed)
-        return
-    
-    search_name = song_name if song_name else current['title']
-    
-    embed = discord.Embed(
-        title="🎤 Tìm lời bài hát",
-        description=f"Đang tìm lời cho: **{search_name}**\n\n*(Chức năng này cần API lyrics để hoạt động)*",
-        color=0x5865F2
-    )
-    await ctx.send(embed=embed)
-
-@bot.command(name='seek', aliases=['sk2'])
-async def seek(ctx, timestamp: str):
-    embed = discord.Embed(
-        description="❌ Chức năng seek chưa được hỗ trợ với stream audio",
-        color=0xED4245
-    )
-    await ctx.send(embed=embed)
-
-@bot.command(name='replay', aliases=['rp'])
-async def replay(ctx):
-    guild_id = ctx.guild.id
-    current = get_current_song(guild_id)
-    
-    if not current:
-        embed = discord.Embed(
-            description="❌ Không có bài hát đang phát",
-            color=0xED4245
-        )
-        await ctx.send(embed=embed)
-        return
-    
-    if guild_id in voice_clients and voice_clients[guild_id].is_playing():
-        voice_clients[guild_id].stop()
-        song_info = await search_youtube(current['webpage_url'])
-        if song_info:
-            await play_song(ctx, song_info)
-    
-    embed = discord.Embed(
-        description=f"🔄 Đang phát lại: **{current['title']}**",
-        color=0x57F287
-    )
-    await ctx.send(embed=embed)
-
-@bot.command(name='autoplay', aliases=['ap'])
-async def autoplay(ctx):
-    embed = discord.Embed(
-        description="🎲 Chức năng autoplay (tự động phát nhạc liên quan) sẽ được cập nhật trong phiên bản sau",
-        color=0x5865F2
-    )
-    await ctx.send(embed=embed)
-
 @bot.command(name='search', aliases=['sr'])
 async def search(ctx, *, query: str):
+    def _sync_search(query_str):
+        ydl_opts = {
+            'format': 'bestaudio*',
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'default_search': 'ytsearch5',
+            'extract_flat': True,
+            'nocheckcertificate': True,
+            'source_address': '0.0.0.0',
+            'socket_timeout': 10,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch5:{query_str}", download=False)
+            if 'entries' in info:
+                return info['entries'][:5]
+            return []
+    
     embed = discord.Embed(
         description=f"🔍 Đang tìm kiếm **{query}**...",
         color=0x5865F2
     )
     status_msg = await ctx.send(embed=embed)
     
-    ydl_search = {
-        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-        'noplaylist': True,
-        'quiet': True,
-        'no_warnings': True,
-        'default_search': 'ytsearch5',
-        'extract_flat': True,
-    }
-    
-    with yt_dlp.YoutubeDL(ydl_search) as ydl:
-        try:
-            info = ydl.extract_info(f"ytsearch5:{query}", download=False)
-            if 'entries' in info:
-                results = info['entries'][:5]
-                await status_msg.delete()
-                
-                embed = discord.Embed(
-                    title=f"🔍 Kết quả tìm kiếm: {query}",
-                    description="Sử dụng `b!play <link>` để phát bài hát",
-                    color=0x5865F2
-                )
-                
-                for i, result in enumerate(results, 1):
-                    title = result.get('title', 'Unknown')
-                    duration = format_duration(result.get('duration', 0))
-                    url = f"https://youtube.com/watch?v={result.get('id', '')}"
-                    uploader = result.get('uploader', 'Unknown')
-                    embed.add_field(
-                        name=f"{i}. {title}",
-                        value=f"[▶️ Phát ngay]({url}) • `{duration}` • `{uploader}`",
-                        inline=False
-                    )
-                
-                embed.set_footer(text="Nhấn vào link để xem trên YouTube")
-                await ctx.send(embed=embed)
-            else:
-                await status_msg.delete()
-                embed = discord.Embed(
-                    description="❌ Không tìm thấy kết quả",
-                    color=0xED4245
-                )
-                await ctx.send(embed=embed)
-        except Exception as e:
-            await status_msg.delete()
+    loop = asyncio.get_event_loop()
+    try:
+        results = await asyncio.wait_for(
+            loop.run_in_executor(executor, _sync_search, query),
+            timeout=15.0
+        )
+        
+        await status_msg.delete()
+        
+        if results:
             embed = discord.Embed(
-                description=f"❌ Lỗi khi tìm kiếm: `{str(e)}`",
+                title=f"🔍 Kết quả tìm kiếm: {query}",
+                description="Sử dụng `b!play <link>` để phát bài hát",
+                color=0x5865F2
+            )
+            
+            for i, result in enumerate(results, 1):
+                title = result.get('title', 'Unknown')
+                duration = format_duration(result.get('duration', 0))
+                url = f"https://youtube.com/watch?v={result.get('id', '')}"
+                uploader = result.get('uploader', 'Unknown')
+                embed.add_field(
+                    name=f"{i}. {title}",
+                    value=f"[▶️ Phát ngay]({url}) • `{duration}` • `{uploader}`",
+                    inline=False
+                )
+            
+            embed.set_footer(text="Nhấn vào link để xem trên YouTube")
+            await ctx.send(embed=embed)
+        else:
+            embed = discord.Embed(
+                description="❌ Không tìm thấy kết quả",
                 color=0xED4245
             )
             await ctx.send(embed=embed)
-
-@bot.command(name='forward', aliases=['ff'])
-async def forward(ctx, seconds: int):
-    embed = discord.Embed(
-        description="❌ Chức năng forward chưa được hỗ trợ với stream audio",
-        color=0xED4245
-    )
-    await ctx.send(embed=embed)
-
-@bot.command(name='rewind', aliases=['rw'])
-async def rewind(ctx, seconds: int):
-    embed = discord.Embed(
-        description="❌ Chức năng rewind chưa được hỗ trợ với stream audio",
-        color=0xED4245
-    )
-    await ctx.send(embed=embed)
-
-@bot.command(name='filters', aliases=['filter'])
-async def filters(ctx, filter_name: str = None):
-    available_filters = ['nightcore', 'bassboost', '8d', 'vaporwave', 'karaoke', 'tremolo']
-    
-    if not filter_name:
+    except asyncio.TimeoutError:
+        await status_msg.delete()
         embed = discord.Embed(
-            title="🎛️ Audio Filters",
-            description=f"**Filters có sẵn:** `{', '.join(available_filters)}`",
-            color=0x5865F2
-        )
-        embed.set_footer(text="Dùng b!filters <tên> để áp dụng filter")
-        await ctx.send(embed=embed)
-        return
-    
-    if filter_name.lower() not in available_filters:
-        embed = discord.Embed(
-            description=f"❌ Filter không tồn tại. Filters có sẵn: `{', '.join(available_filters)}`",
+            description="❌ Quá thời gian tìm kiếm",
             color=0xED4245
         )
         await ctx.send(embed=embed)
-        return
-    
-    embed = discord.Embed(
-        description=f"🎛️ Chức năng filter **{filter_name}** sẽ được cập nhật trong phiên bản sau",
-        color=0x5865F2
-    )
-    await ctx.send(embed=embed)
-
-@bot.command(name='speed', aliases=['sp'])
-async def speed(ctx, speed_value: float = 1.0):
-    if speed_value < 0.5 or speed_value > 2.0:
+    except Exception as e:
+        await status_msg.delete()
         embed = discord.Embed(
-            description="❌ Tốc độ phải từ 0.5 đến 2.0",
+            description=f"❌ Lỗi khi tìm kiếm",
             color=0xED4245
         )
         await ctx.send(embed=embed)
-        return
-    
-    embed = discord.Embed(
-        description=f"⚡ Chức năng thay đổi tốc độ **x{speed_value}** sẽ được cập nhật trong phiên bản sau",
-        color=0x5865F2
-    )
-    await ctx.send(embed=embed)
-
-@bot.command(name='bass', aliases=['b'])
-async def bass(ctx, level: int = 0):
-    if level < 0 or level > 100:
-        embed = discord.Embed(
-            description="❌ Bass level phải từ 0 đến 100",
-            color=0xED4245
-        )
-        await ctx.send(embed=embed)
-        return
-    
-    embed = discord.Embed(
-        description=f"🔊 Chức năng bass boost **level {level}** sẽ được cập nhật trong phiên bản sau",
-        color=0x5865F2
-    )
-    await ctx.send(embed=embed)
 
 @bot.command(name='removedupes', aliases=['rd'])
 async def removedupes(ctx):
@@ -1060,22 +1058,6 @@ async def grab(ctx):
         )
         await ctx.send(embed=embed)
 
-@bot.command(name='history', aliases=['hist'])
-async def history(ctx):
-    embed = discord.Embed(
-        description="📜 Chức năng lịch sử phát sẽ được cập nhật trong phiên bản sau",
-        color=0x5865F2
-    )
-    await ctx.send(embed=embed)
-
-@bot.command(name='lyrics247', aliases=['ly247'])
-async def lyrics247(ctx):
-    embed = discord.Embed(
-        description="🎤 Chức năng hiển thị lời bài hát liên tục sẽ được cập nhật trong phiên bản sau",
-        color=0x5865F2
-    )
-    await ctx.send(embed=embed)
-
 @bot.command(name='playskip', aliases=['ps'])
 async def playskip(ctx, *, query: str):
     if not ctx.author.voice:
@@ -1092,6 +1074,7 @@ async def playskip(ctx, *, query: str):
     if guild_id not in voice_clients or not voice_clients[guild_id].is_connected():
         voice_client = await channel.connect()
         voice_clients[guild_id] = voice_client
+        await check_alone_in_channel(guild_id)
     
     embed = discord.Embed(
         description=f"🔍 Đang tìm kiếm **{query}**...",
@@ -1179,7 +1162,7 @@ async def info(ctx):
     
     embed = discord.Embed(
         title="ℹ️ BensMusic Information",
-        description="Bot phát nhạc Discord",
+        description="Bot phát nhạc Discord chất lượng cao",
         color=0x5865F2
     )
     embed.add_field(name="📊 Servers", value=f"`{guild_count}`", inline=True)
@@ -1187,8 +1170,8 @@ async def info(ctx):
     embed.add_field(name="⚡ Latency", value=f"`{round(bot.latency * 1000)}ms`", inline=True)
     embed.add_field(name="🔧 Prefix", value="`b!`", inline=True)
     embed.add_field(name="📚 Library", value="`discord.py`", inline=True)
-    embed.add_field(name="🐍 Python", value="`3.8+`", inline=True)
-    embed.set_footer(text="BensMusic v2.0 • High Quality Audio")
+    embed.add_field(name="🎵 Audio", value="`512kbps HQ`", inline=True)
+    embed.set_footer(text="BensMusic v2.1")
     embed.timestamp = discord.utils.utcnow()
     
     await ctx.send(embed=embed)
@@ -1212,10 +1195,10 @@ async def invite(ctx):
     )
     embed.add_field(
         name="🔗 Link mời bot",
-        value="https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=36700160&scope=bot",
+        value="https://discord.com/api/oauth2/authorize?client_id=1414584931274854400&permissions=36700160&scope=bot",
         inline=False
     )
-    embed.set_footer(text="Thay YOUR_CLIENT_ID bằng Client ID của bot")
+    embed.set_footer(text="BensMusic v2.1")
     
     await ctx.send(embed=embed)
 
@@ -1236,8 +1219,12 @@ async def support(ctx):
         value="[View Source Code](https://github.com/BensG0ming/BensMusic)",
         inline=False
     )
-    embed.set_footer(text="BensMusic v2.0")
+    embed.set_footer(text="BensMusic v2.1")
     
     await ctx.send(embed=embed)
+
+@bot.event
+async def on_disconnect():
+    executor.shutdown(wait=False)
 
 bot.run('DEO_CO_TOKEN')
