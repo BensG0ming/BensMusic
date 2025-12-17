@@ -150,6 +150,12 @@ async def play_next(ctx):
             await play_song(ctx, full_info)
     else:
         set_current_song(guild_id, None)
+        voice_client = voice_clients.get(guild_id)
+        if voice_client and voice_client.is_connected():
+            try:
+                await voice_client.channel.edit(status=None)
+            except:
+                pass
         embed = discord.Embed(
             description="⏹️ Queue đã kết thúc. Sử dụng `b!play` để phát nhạc mới!",
             color=0x2F3136
@@ -164,6 +170,11 @@ async def play_song(ctx, song_info):
         return
     
     set_current_song(guild_id, song_info)
+    
+    try:
+        await voice_client.channel.edit(status=f"Đang nghe: {song_info['title'][:480]}")
+    except:
+        pass
     
     def after_playing(error):
         if error:
@@ -214,7 +225,12 @@ async def play_song(ctx, song_info):
 @bot.event
 async def on_ready():
     print(f'{bot.user} đã sẵn sàng!')
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="b!help"))
+    
+    activity = discord.Activity(
+        type=discord.ActivityType.listening,
+        name="BensMusic | b!help"
+    )
+    await bot.change_presence(activity=activity)
 
 @bot.command(name='play', aliases=['p'])
 async def play(ctx, *, query: str):
@@ -302,6 +318,12 @@ async def stop(ctx):
     guild_id = ctx.guild.id
     if guild_id in voice_clients and voice_clients[guild_id].is_connected():
         voice_client = voice_clients[guild_id]
+        
+        try:
+            await voice_client.channel.edit(status=None)
+        except:
+            pass
+        
         if voice_client.is_playing():
             voice_client.stop()
         await voice_client.disconnect()
@@ -695,6 +717,12 @@ async def leave(ctx):
         return
     
     voice_client = voice_clients[guild_id]
+    
+    try:
+        await voice_client.channel.edit(status=None)
+    except:
+        pass
+    
     if voice_client.is_playing():
         voice_client.stop()
     await voice_client.disconnect()
@@ -1151,7 +1179,7 @@ async def info(ctx):
     
     embed = discord.Embed(
         title="ℹ️ BensMusic Information",
-        description="Bot phát nhạc Discord chất lượng cao",
+        description="Bot phát nhạc Discord",
         color=0x5865F2
     )
     embed.add_field(name="📊 Servers", value=f"`{guild_count}`", inline=True)
@@ -1184,7 +1212,7 @@ async def invite(ctx):
     )
     embed.add_field(
         name="🔗 Link mời bot",
-        value="[Click để mời bot vào server của bạn](https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=36700160&scope=bot)",
+        value="https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=36700160&scope=bot",
         inline=False
     )
     embed.set_footer(text="Thay YOUR_CLIENT_ID bằng Client ID của bot")
@@ -1212,4 +1240,4 @@ async def support(ctx):
     
     await ctx.send(embed=embed)
 
-bot.run('YOUR_BOT_TOKEN_HERE')
+bot.run('DEO_CO_TOKEN')
